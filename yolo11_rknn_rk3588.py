@@ -4,6 +4,7 @@ import cv2
 from rknnlite.api import RKNNLite
 from math import exp
 import argparse
+import time
 
 # 定义类别名称
 CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
@@ -16,7 +17,7 @@ CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
            'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
            'hair drier', 'toothbrush']
 
-# 定义一些常量
+# 定义常量
 class_num = len(CLASSES)
 headNum = 3
 strides = [8, 16, 32]
@@ -24,7 +25,7 @@ mapSize = [[80, 80], [40, 40], [20, 20]]
 input_imgH = 640
 input_imgW = 640
 
-# 定义检测框类
+# 检测框类
 class DetectBox:
     def __init__(self, classId, score, xmin, ymin, xmax, ymax):
         self.classId = classId
@@ -34,16 +35,15 @@ class DetectBox:
         self.xmax = xmax
         self.ymax = ymax
 
-# Yolo11推理类
+# 优化后的Yolo11推理类
 class Yolo11Inference:
     def __init__(self, model_path, conf_thresh=0.5, nms_thresh=0.5):
         self.model_path = model_path
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
-        self.meshgrid = []
+        self.meshgrid = self.generate_meshgrid()  # 直接生成网格
         self.rknn = RKNNLite()
         self.load_model()
-        self.generate_meshgrid()
 
     def load_model(self):
         """加载RKNN模型"""
@@ -60,11 +60,12 @@ class Yolo11Inference:
 
     def generate_meshgrid(self):
         """生成网格坐标"""
+        meshgrid = []
         for index in range(headNum):
             for i in range(mapSize[index][0]):
                 for j in range(mapSize[index][1]):
-                    self.meshgrid.append(j + 0.5)
-                    self.meshgrid.append(i + 0.5)
+                    meshgrid.append((j + 0.5, i + 0.5))
+        return np.array(meshgrid)
 
     def iou(self, box1, box2):
         """计算两个框的IoU"""
@@ -84,7 +85,7 @@ class Yolo11Inference:
         area2 = (xmax2 - xmin2) * (ymax2 - ymin2)
 
         total = area1 + area2 - inner_area
-        return inner_area / total
+        return inner_area / total if total > 0 else 0
 
     def nms(self, detect_result):
         """非极大值抑制"""
@@ -92,102 +93,63 @@ class Yolo11Inference:
         sorted_detect_boxes = sorted(detect_result, key=lambda x: x.score, reverse=True)
 
         for i in range(len(sorted_detect_boxes)):
-            xmin1 = sorted_detect_boxes[i].xmin
-            ymin1 = sorted_detect_boxes[i].ymin
-            xmax1 = sorted_detect_boxes[i].xmax
-            ymax1 = sorted_detect_boxes[i].ymax
-            classId = sorted_detect_boxes[i].classId
+            if sorted_detect_boxes[i].classId == -1:
+                continue  # 跳过已经处理过的框
 
-            if sorted_detect_boxes[i].classId != -1:
-                pred_boxes.append(sorted_detect_boxes[i])
-                for j in range(i + 1, len(sorted_detect_boxes)):
-                    if classId == sorted_detect_boxes[j].classId:
-                        xmin2 = sorted_detect_boxes[j].xmin
-                        ymin2 = sorted_detect_boxes[j].ymin
-                        xmax2 = sorted_detect_boxes[j].xmax
-                        ymax2 = sorted_detect_boxes[j].ymax
-                        iou = self.iou((xmin1, ymin1, xmax1, ymax1), (xmin2, ymin2, xmax2, ymax2))
-                        if iou > self.nms_thresh:
-                            sorted_detect_boxes[j].classId = -1
+            box1 = sorted_detect_boxes[i]
+            pred_boxes.append(box1)
+
+            for j in range(i + 1, len(sorted_detect_boxes)):
+                if sorted_detect_boxes[j].classId == -1:
+                    continue
+                if box1.classId == sorted_detect_boxes[j].classId:
+                    box2 = sorted_detect_boxes[j]
+                    if self.iou((box1.xmin, box1.ymin, box1.xmax, box1.ymax),
+                                (box2.xmin, box2.ymin, box2.xmax, box2.ymax)) > self.nms_thresh:
+                        sorted_detect_boxes[j].classId = -1  # 标记为已处理
         return pred_boxes
 
     def sigmoid(self, x):
-        """sigmoid函数"""
-        return 1 / (1 + exp(-x))
+        """sigmoid函数，使用NumPy向量化"""
+        return 1 / (1 + np.exp(-x))
 
     def postprocess(self, outputs, img_h, img_w):
-        """后处理函数"""
-        print('postprocess ... ')
+        """后处理"""
+        print('postprocess ...')
 
         detect_result = []
-        output = [out.reshape((-1)) for out in outputs]
+        output = [out.flatten() for out in outputs]
 
         scale_h = img_h / input_imgH
         scale_w = img_w / input_imgW
 
-        grid_index = -2
-        cls_index = 0
-        cls_max = 0
-
         for index in range(headNum):
-            cls = output[index * 2 + 1]
-            reg = output[index * 2 + 0]
+            cls = self.sigmoid(output[index * 2 + 1])  # 向量化sigmoid
+            reg = np.exp(output[index * 2])  # 向量化exp
+            grid = self.meshgrid[:mapSize[index][0] * mapSize[index][1]]
 
-            for h in range(mapSize[index][0]):
-                for w in range(mapSize[index][1]):
-                    grid_index += 2
+            for idx, (grid_x, grid_y) in enumerate(grid):
+                cls_vals = cls[idx * class_num:(idx + 1) * class_num]
+                cls_max = np.max(cls_vals)
+                cls_index = np.argmax(cls_vals)
 
-                    if 1 == class_num:
-                        cls_max = self.sigmoid(cls[0 * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w])
-                        cls_index = 0
-                    else:
-                        for cl in range(class_num):
-                            cls_val = cls[cl * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w]
-                            if 0 == cl:
-                                cls_max = cls_val
-                                cls_index = cl
-                            else:
-                                if cls_val > cls_max:
-                                    cls_max = cls_val
-                                    cls_index = cl
-                        cls_max = self.sigmoid(cls_max)
+                if cls_max > self.conf_thresh:
+                    reg_vals = reg[idx * 64:(idx + 1) * 64].reshape(4, 16)
+                    regdfl = [np.sum((np.arange(16) * (vals / np.sum(vals)))) for vals in reg_vals]
 
-                    if cls_max > self.conf_thresh:
-                        regdfl = []
-                        for lc in range(4):
-                            sfsum = 0
-                            locval = 0
-                            for df in range(16):
-                                temp = exp(reg[((lc * 16) + df) * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w])
-                                reg[((lc * 16) + df) * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w] = temp
-                                sfsum += temp
+                    x1 = (grid_x - regdfl[0]) * strides[index] * scale_w
+                    y1 = (grid_y - regdfl[1]) * strides[index] * scale_h
+                    x2 = (grid_x + regdfl[2]) * strides[index] * scale_w
+                    y2 = (grid_y + regdfl[3]) * strides[index] * scale_h
 
-                            for df in range(16):
-                                sfval = reg[((lc * 16) + df) * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w] / sfsum
-                                locval += sfval * df
-                            regdfl.append(locval)
+                    xmin = max(0, x1)
+                    ymin = max(0, y1)
+                    xmax = min(img_w, x2)
+                    ymax = min(img_h, y2)
 
-                        x1 = (self.meshgrid[grid_index + 0] - regdfl[0]) * strides[index]
-                        y1 = (self.meshgrid[grid_index + 1] - regdfl[1]) * strides[index]
-                        x2 = (self.meshgrid[grid_index + 0] + regdfl[2]) * strides[index]
-                        y2 = (self.meshgrid[grid_index + 1] + regdfl[3]) * strides[index]
+                    detect_result.append(DetectBox(cls_index, cls_max, xmin, ymin, xmax, ymax))
 
-                        xmin = x1 * scale_w
-                        ymin = y1 * scale_h
-                        xmax = x2 * scale_w
-                        ymax = y2 * scale_h
-
-                        xmin = xmin if xmin > 0 else 0
-                        ymin = ymin if ymin > 0 else 0
-                        xmax = xmax if xmax < img_w else img_w
-                        ymax = ymax if ymax < img_h else img_h
-
-                        box = DetectBox(cls_index, cls_max, xmin, ymin, xmax, ymax)
-                        detect_result.append(box)
-        # NMS
-        pred_box = self.nms(detect_result)
-
-        return pred_box
+        return self.nms(detect_result)
 
     def inference(self, img):
         """推理函数"""
@@ -200,8 +162,9 @@ class Yolo11Inference:
         """释放RKNN资源"""
         self.rknn.release()
 
+
 if __name__ == '__main__':
-    print('This is main ...')
+    print('yolo11 rknnlite demo on RK3588 ...')
     parser = argparse.ArgumentParser(prog=__file__)
     parser.add_argument('--input', type=str, default='./img/bus.jpg', help='path of input')
     parser.add_argument('--model', type=str, default='./weights/yolo11s_sim-640-640_rm_dfl_rk3588.rknn', help='path of bmodel')
@@ -214,13 +177,22 @@ if __name__ == '__main__':
     orig_img = cv2.imread(args.input)
     img_h, img_w = orig_img.shape[:2]
 
-    origimg = cv2.resize(orig_img, (input_imgW, input_imgH), interpolation=cv2.INTER_LINEAR)
+    origimg = cv2.resize(orig_img, (input_imgW, input_imgH), interpolation=cv2.INTER_NEAREST)
     origimg = cv2.cvtColor(origimg, cv2.COLOR_BGR2RGB)
 
     img = np.expand_dims(origimg, 0)
 
+    # 记录推理开始时间
+    start_time = time.time()
+
     outputs = yolo11_inference.inference(img)
     predbox = yolo11_inference.postprocess(outputs, img_h, img_w)
+
+    # 记录推理结束时间
+    end_time = time.time()
+    # 计算推理耗时
+    inference_time = end_time - start_time
+    print(f"Inference time: {inference_time:.4f} seconds")
 
     print(len(predbox))
 
