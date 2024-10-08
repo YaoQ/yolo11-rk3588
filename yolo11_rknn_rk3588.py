@@ -1,16 +1,11 @@
 import os
-import urllib
-import traceback
-import time
-import sys
 import numpy as np
 import cv2
 from rknnlite.api import RKNNLite
 from math import exp
 import argparse
 
-QUANTIZE_ON = True
-
+# 定义类别名称
 CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
            'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
            'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
@@ -21,14 +16,15 @@ CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
            'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
            'hair drier', 'toothbrush']
 
+# 定义一些常量
 class_num = len(CLASSES)
 headNum = 3
 strides = [8, 16, 32]
 mapSize = [[80, 80], [40, 40], [20, 20]]
-
 input_imgH = 640
 input_imgW = 640
 
+# 定义检测框类
 class DetectBox:
     def __init__(self, classId, score, xmin, ymin, xmax, ymax):
         self.classId = classId
@@ -38,7 +34,8 @@ class DetectBox:
         self.xmax = xmax
         self.ymax = ymax
 
-class Yolo11:
+# Yolo11推理类
+class Yolo11Inference:
     def __init__(self, model_path, conf_thresh=0.5, nms_thresh=0.5):
         self.model_path = model_path
         self.conf_thresh = conf_thresh
@@ -49,6 +46,7 @@ class Yolo11:
         self.generate_meshgrid()
 
     def load_model(self):
+        """加载RKNN模型"""
         ret = self.rknn.load_rknn(self.model_path)
         if ret != 0:
             print('Load RKNN model failed!')
@@ -61,6 +59,7 @@ class Yolo11:
         print('Model loaded and initialized.')
 
     def generate_meshgrid(self):
+        """生成网格坐标"""
         for index in range(headNum):
             for i in range(mapSize[index][0]):
                 for j in range(mapSize[index][1]):
@@ -68,6 +67,7 @@ class Yolo11:
                     self.meshgrid.append(i + 0.5)
 
     def iou(self, box1, box2):
+        """计算两个框的IoU"""
         xmin1, ymin1, xmax1, ymax1 = box1
         xmin2, ymin2, xmax2, ymax2 = box2
 
@@ -87,6 +87,7 @@ class Yolo11:
         return inner_area / total
 
     def nms(self, detect_result):
+        """非极大值抑制"""
         pred_boxes = []
         sorted_detect_boxes = sorted(detect_result, key=lambda x: x.score, reverse=True)
 
@@ -111,9 +112,11 @@ class Yolo11:
         return pred_boxes
 
     def sigmoid(self, x):
+        """sigmoid函数"""
         return 1 / (1 + exp(-x))
 
     def postprocess(self, outputs, img_h, img_w):
+        """后处理函数"""
         print('postprocess ... ')
 
         detect_result = []
@@ -187,16 +190,18 @@ class Yolo11:
         return pred_box
 
     def inference(self, img):
+        """推理函数"""
         print('--> Running model')
         outputs = self.rknn.inference(inputs=[img])
         print('done')
         return outputs
 
     def release(self):
+        """释放RKNN资源"""
         self.rknn.release()
 
 if __name__ == '__main__':
-    print('yolo11 RKNNlite inference demo...')
+    print('This is main ...')
     parser = argparse.ArgumentParser(prog=__file__)
     parser.add_argument('--input', type=str, default='./img/bus.jpg', help='path of input')
     parser.add_argument('--model', type=str, default='./weights/yolo11s_sim-640-640_rm_dfl_rk3588.rknn', help='path of bmodel')
@@ -204,7 +209,7 @@ if __name__ == '__main__':
     parser.add_argument('--nms_thresh', type=float, default=0.5, help='nms threshold')
     args = parser.parse_args()
 
-    yolo11_inference = Yolo11(args.model, args.conf_thresh, args.nms_thresh)
+    yolo11_inference = Yolo11Inference(args.model, args.conf_thresh, args.nms_thresh)
 
     orig_img = cv2.imread(args.input)
     img_h, img_w = orig_img.shape[:2]
@@ -217,7 +222,7 @@ if __name__ == '__main__':
     outputs = yolo11_inference.inference(img)
     predbox = yolo11_inference.postprocess(outputs, img_h, img_w)
 
-    print("Object detected: ", len(predbox))
+    print(len(predbox))
 
     for i in range(len(predbox)):
         xmin = int(predbox[i].xmin)
